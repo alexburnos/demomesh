@@ -1,0 +1,26 @@
+syntax = "proto3";
+package demomesh;
+
+message BackendReply {
+    BackendParams params = 1;
+    BackendReplyError error = 2;
+    // An original URL that was used to query this Backend.
+    string urlRequested = 3;
+    repeated BackendReply backends = 4;
+}
+
+// Parameters of the service as configured on the backend.
+message BackendParams {
+    // Name of the service as configured on this backend.
+    string name = 1;
+    // Port backend is configured to serve on.
+    int32   port = 2;
+    // An hostname of the host service runs on.
+    string hostname = 3;
+}
+
+
+message BackendReplyError {
+    bool isError = 1;
+    string errorString = 2;
+}

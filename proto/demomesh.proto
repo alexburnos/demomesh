@@ -24,3 +24,11 @@ message BackendReplyError {
     bool isError = 1;
     string errorString = 2;
 }
+
+message BackendRequest {
+    int32 id = 1;
+}
+
+service DemomeshService {
+    rpc GetBackendInfo(BackendRequest) returns (BackendReply) {}
+}

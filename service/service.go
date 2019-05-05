@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -12,10 +14,14 @@ import (
 
 	pb "github.com/alexburnos/demomesh/proto"
 	"github.com/golang/protobuf/jsonpb"
+	"google.golang.org/grpc"
 )
 
-// TCP port service will serve on.
-var servingPort int
+// TCP port service will serve its frontend on.
+var frontendPort int
+
+// TCP port service will serve its backend on.
+var backendPort int
 
 // Free form name of the service.
 var serviceName string
@@ -26,6 +32,12 @@ var frontendPath = "/"
 // URL path for the service backend.
 var backendPath = "/backend"
 
+// Port to use for GRPC serving. If not -1, then client connections will be over GRPC as well.
+var enableGRPC bool
+
+// List of hostnames in host:port format that are backends for this service
+var backends []string
+
 // Serves HTML response to the "frontend" of the service.
 func handleFrontend(w http.ResponseWriter, r *http.Request, backends []string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -35,7 +47,12 @@ func handleFrontend(w http.ResponseWriter, r *http.Request, backends []string) {
 	if backends != nil {
 		reply += "<h2>I process my requests through:</h2>"
 		for _, backend := range backends {
-			backendData := fetchBackendDataOverHTTP(backend)
+			var backendData pb.BackendReply
+			if enableGRPC {
+				backendData = fetchBackendDataOverGRPC(backend)
+			} else {
+				backendData = fetchBackendDataOverHTTP(backend)
+			}
 			reply += backendReplyToHTML(backendData)
 		}
 		reply += "</body></html>"
@@ -51,13 +68,18 @@ func createBackendReply(backends []string) (reply pb.BackendReply) {
 	params := &pb.BackendParams{Name: serviceName}
 	params.Name = serviceName
 	params.Hostname, _ = os.Hostname()
-	params.Port = int32(servingPort)
+	params.Port = int32(frontendPort)
 
 	reply.Params = params
 
 	// Resolution of service's upstream backends
 	for _, backend := range backends {
-		newBackend := fetchBackendDataOverHTTP(backend)
+		var newBackend pb.BackendReply
+		if enableGRPC {
+			newBackend = fetchBackendDataOverGRPC(backend)
+		} else {
+			newBackend = fetchBackendDataOverHTTP(backend)
+		}
 		reply.Backends = append(reply.Backends, &newBackend)
 	}
 
@@ -65,7 +87,7 @@ func createBackendReply(backends []string) (reply pb.BackendReply) {
 }
 
 // Serves BackendReply as JSON over HTTP
-func handleBackend(w http.ResponseWriter, r *http.Request, backends []string) {
+func handleBackendReplyOverHTTP(w http.ResponseWriter, r *http.Request, backends []string) {
 	w.Header().Set("Content-Type", "application/json")
 	reply := createBackendReply(backends)
 
@@ -82,7 +104,7 @@ func handleBackend(w http.ResponseWriter, r *http.Request, backends []string) {
 func backendReplyToHTML(backend pb.BackendReply) (out string) {
 	out += "<ul>"
 	if backend.Error != nil {
-		out += "<li><u><font color=red>Backend Error</font></u>"
+		out += "<li><u><font color=red>Backend Error</font>22</u>"
 		out += "<li>Requested URL: " + backend.UrlRequested
 		out += "<li>Error: " + backend.Error.ErrorString
 		out += "</ul>"
@@ -133,27 +155,79 @@ func fetchBackendDataOverHTTP(hostname string) (data pb.BackendReply) {
 	return
 }
 
+// Gets reply from backend over gRPC.
+func fetchBackendDataOverGRPC(hostname string) (data pb.BackendReply) {
+	debugHostname := "grpc://" + hostname
+	conn, err := grpc.Dial(hostname, grpc.WithInsecure())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	client := pb.NewDemomeshServiceClient(conn)
+
+	req := pb.BackendRequest{Id: 1}
+	r, err := client.GetBackendInfo(context.Background(), &req)
+	if err != nil {
+		backendError := createBackendReplyError(debugHostname, err)
+		data.Error = &backendError
+		return
+	}
+	data = *r
+	data.UrlRequested = debugHostname
+
+	return
+}
+
+type demomeshServiceServer struct{}
+
+func (s *demomeshServiceServer) GetBackendInfo(ctx context.Context, req *pb.BackendRequest) (*pb.BackendReply, error) {
+	reply := createBackendReply(backends)
+	return &reply, nil
+}
+
 func main() {
 	flag.StringVar(&serviceName, "name", "service", "A name of the service.")
-	flag.IntVar(&servingPort, "port", 8080, "TCP port to serve service on.")
+	flag.IntVar(&frontendPort, "fport", 8080, "Port for HTTP frontend of the service.")
+	flag.IntVar(&backendPort, "bport", 9000, "Port for HTTP or GRPC backend of the service.")
+	flag.BoolVar(&enableGRPC, "grpc", false, "Uses GRPC instead of HTTP to serve and connect to other backends.")
 	backendsList := flag.String("backends", "", "Comma-separated list of HTTP backends in host:port format.")
 	flag.Parse()
 
-	var backends []string
+	if frontendPort >= 0 {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			handleFrontend(w, r, backends)
+		})
+
+		go func() {
+			fmt.Println("Starting HTTP frontend for service ", serviceName, " on port ", frontendPort)
+			if err := http.ListenAndServe(":"+strconv.Itoa(int(frontendPort)), nil); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
 
 	if *backendsList != "" {
 		backends = strings.Split(*backendsList, ",")
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleFrontend(w, r, backends)
-	})
-	http.HandleFunc("/backend", func(w http.ResponseWriter, r *http.Request) {
-		handleBackend(w, r, backends)
-	})
-
-	fmt.Println("Starting serving service ", serviceName, " on port ", servingPort)
-	if err := http.ListenAndServe(":"+strconv.Itoa(int(servingPort)), nil); err != nil {
-		log.Fatal(err)
+	if enableGRPC {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", backendPort))
+		if err != nil {
+			log.Fatalf("Failed to listen for gRPC: %v", err)
+		}
+		fmt.Println("Starting gRPC backend for service ", serviceName, " on port ", backendPort)
+		grpcServer := grpc.NewServer()
+		s := demomeshServiceServer{}
+		pb.RegisterDemomeshServiceServer(grpcServer, &s)
+		grpcServer.Serve(l)
+	} else {
+		http.HandleFunc("/backend", func(w http.ResponseWriter, r *http.Request) {
+			handleBackendReplyOverHTTP(w, r, backends)
+		})
+		fmt.Println("Starting HTTP backend for service ", serviceName, " on port ", backendPort)
+		if err := http.ListenAndServe(":"+strconv.Itoa(int(backendPort)), nil); err != nil {
+			log.Fatal(err)
+		}
 	}
 }

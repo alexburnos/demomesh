@@ -1,7 +1,7 @@
 # Demomesh
 Demomesh is a simple binary that can be used to create mesh of services.
 
-Demomesh helps to simulate microservices running indepdendently, but communicating
+Demomesh helps to simulate microservices running independently, but communicating
 over network using JSON over HTTP.
 
 Each demomesh service has a frontend serving at root ("/" path) and a backend serving

@@ -38,6 +38,9 @@ var enableGRPC bool
 // List of hostnames in host:port format that are backends for this service
 var backends []string
 
+// A name of the HTTP header to propagate tracing information in.
+var traceIDHeader = "x-request-id"
+
 // Serves HTML response to the "frontend" of the service.
 func handleFrontend(w http.ResponseWriter, r *http.Request, backends []string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -51,7 +54,7 @@ func handleFrontend(w http.ResponseWriter, r *http.Request, backends []string) {
 			if enableGRPC {
 				backendData = fetchBackendDataOverGRPC(backend)
 			} else {
-				backendData = fetchBackendDataOverHTTP(backend)
+				backendData = fetchBackendDataOverHTTP(backend, "")
 			}
 			reply += backendReplyToHTML(backendData)
 		}
@@ -64,7 +67,7 @@ func handleFrontend(w http.ResponseWriter, r *http.Request, backends []string) {
 }
 
 // Populates BackendReply with service-specific parameters
-func createBackendReply(backends []string) (reply pb.BackendReply) {
+func createBackendReply(backends []string, traceID string) (reply pb.BackendReply) {
 	params := &pb.BackendParams{Name: serviceName}
 	params.Name = serviceName
 	params.Hostname, _ = os.Hostname()
@@ -78,7 +81,7 @@ func createBackendReply(backends []string) (reply pb.BackendReply) {
 		if enableGRPC {
 			newBackend = fetchBackendDataOverGRPC(backend)
 		} else {
-			newBackend = fetchBackendDataOverHTTP(backend)
+			newBackend = fetchBackendDataOverHTTP(backend, traceID)
 		}
 		reply.Backends = append(reply.Backends, &newBackend)
 	}
@@ -88,8 +91,9 @@ func createBackendReply(backends []string) (reply pb.BackendReply) {
 
 // Serves BackendReply as JSON over HTTP
 func handleBackendReplyOverHTTP(w http.ResponseWriter, r *http.Request, backends []string) {
+	traceID := r.Header.Get(traceIDHeader)
 	w.Header().Set("Content-Type", "application/json")
-	reply := createBackendReply(backends)
+	reply := createBackendReply(backends, traceID)
 
 	var m jsonpb.Marshaler
 	b := new(bytes.Buffer)
@@ -135,17 +139,29 @@ func createBackendReplyError(requestedURL string, err error) (backendError pb.Ba
 }
 
 // Gets JSON from a backend via HTTP.
-func fetchBackendDataOverHTTP(hostname string) (data pb.BackendReply) {
+func fetchBackendDataOverHTTP(hostname string, traceID string) (data pb.BackendReply) {
 	fetchURL := "http://" + hostname + backendPath
 	data.UrlRequested = fetchURL
-	r, err := http.Get(fetchURL)
+
+	client := &http.Client{}
+
+	req, err := http.NewRequest("GET", fetchURL, nil)
+	if err != nil {
+		backendError := createBackendReplyError(fetchURL, err)
+		data.Error = &backendError
+	}
+
+	if traceID != "" {
+		req.Header.Add(traceIDHeader, traceID)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		backendError := createBackendReplyError(fetchURL, err)
 		data.Error = &backendError
 		return
 	}
 
-	jsonpb.Unmarshal(r.Body, &data)
+	err = jsonpb.Unmarshal(resp.Body, &data)
 	if err != nil {
 		backendError := createBackendReplyError(fetchURL, err)
 		data.Error = &backendError
@@ -182,7 +198,7 @@ func fetchBackendDataOverGRPC(hostname string) (data pb.BackendReply) {
 type demomeshServiceServer struct{}
 
 func (s *demomeshServiceServer) GetBackendInfo(ctx context.Context, req *pb.BackendRequest) (*pb.BackendReply, error) {
-	reply := createBackendReply(backends)
+	reply := createBackendReply(backends, "")
 	return &reply, nil
 }
 

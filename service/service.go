@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"contrib.go.opencensus.io/exporter/stackdriver/propagation"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 
 	pb "github.com/alexburnos/demomesh/proto"
 	"github.com/golang/protobuf/jsonpb"
+	"go.opencensus.io/plugin/ochttp"
 	"google.golang.org/grpc"
 )
 
@@ -54,7 +56,7 @@ func handleFrontend(w http.ResponseWriter, r *http.Request, backends []string) {
 			if enableGRPC {
 				backendData = fetchBackendDataOverGRPC(backend)
 			} else {
-				backendData = fetchBackendDataOverHTTP(backend, "")
+				backendData = fetchBackendDataOverHTTP(backend, r.Context())
 			}
 			reply += backendReplyToHTML(backendData)
 		}
@@ -67,7 +69,7 @@ func handleFrontend(w http.ResponseWriter, r *http.Request, backends []string) {
 }
 
 // Populates BackendReply with service-specific parameters
-func createBackendReply(backends []string, traceID string) (reply pb.BackendReply) {
+func createBackendReply(backends []string, ctx context.Context) (reply pb.BackendReply) {
 	params := &pb.BackendParams{Name: serviceName}
 	params.Name = serviceName
 	params.Hostname, _ = os.Hostname()
@@ -81,7 +83,7 @@ func createBackendReply(backends []string, traceID string) (reply pb.BackendRepl
 		if enableGRPC {
 			newBackend = fetchBackendDataOverGRPC(backend)
 		} else {
-			newBackend = fetchBackendDataOverHTTP(backend, traceID)
+			newBackend = fetchBackendDataOverHTTP(backend, ctx)
 		}
 		reply.Backends = append(reply.Backends, &newBackend)
 	}
@@ -91,9 +93,8 @@ func createBackendReply(backends []string, traceID string) (reply pb.BackendRepl
 
 // Serves BackendReply as JSON over HTTP
 func handleBackendReplyOverHTTP(w http.ResponseWriter, r *http.Request, backends []string) {
-	traceID := r.Header.Get(traceIDHeader)
 	w.Header().Set("Content-Type", "application/json")
-	reply := createBackendReply(backends, traceID)
+	reply := createBackendReply(backends, r.Context())
 
 	var m jsonpb.Marshaler
 	b := new(bytes.Buffer)
@@ -139,20 +140,24 @@ func createBackendReplyError(requestedURL string, err error) (backendError pb.Ba
 }
 
 // Gets JSON from a backend via HTTP.
-func fetchBackendDataOverHTTP(hostname string, traceID string) (data pb.BackendReply) {
+func fetchBackendDataOverHTTP(hostname string, ctx context.Context) (data pb.BackendReply) {
 	fetchURL := "http://" + hostname + backendPath
 	data.UrlRequested = fetchURL
 
-	client := &http.Client{}
-
+	client := &http.Client{
+		Transport: &ochttp.Transport{
+			// Use Google Cloud propagation format.
+			Propagation: &propagation.HTTPFormat{},
+		},
+	}
 	req, err := http.NewRequest("GET", fetchURL, nil)
 	if err != nil {
 		backendError := createBackendReplyError(fetchURL, err)
 		data.Error = &backendError
 	}
 
-	if traceID != "" {
-		req.Header.Add(traceIDHeader, traceID)
+	if ctx != nil {
+		req = req.WithContext(ctx)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -198,7 +203,7 @@ func fetchBackendDataOverGRPC(hostname string) (data pb.BackendReply) {
 type demomeshServiceServer struct{}
 
 func (s *demomeshServiceServer) GetBackendInfo(ctx context.Context, req *pb.BackendRequest) (*pb.BackendReply, error) {
-	reply := createBackendReply(backends, "")
+	reply := createBackendReply(backends, nil)
 	return &reply, nil
 }
 
